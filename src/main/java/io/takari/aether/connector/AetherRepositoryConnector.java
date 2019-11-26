@@ -22,7 +22,14 @@ import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.Callable;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.Executor;
+import java.util.concurrent.Future;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 import javax.net.ssl.SSLSocketFactory;
@@ -59,6 +66,8 @@ import org.eclipse.aether.transfer.TransferEvent.RequestType;
 import org.eclipse.aether.transfer.TransferResource;
 import org.eclipse.aether.util.ChecksumUtils;
 import org.eclipse.aether.util.ConfigUtils;
+import org.eclipse.aether.util.concurrency.RunnableErrorForwarder;
+import org.eclipse.aether.util.concurrency.WorkerThreadFactory;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -90,16 +99,20 @@ import io.takari.aether.client.Response;
 import io.takari.aether.client.RetryableSource;
 import io.takari.aether.okhttp.OkHttpAetherClient;
 
+
+
 class AetherRepositoryConnector implements RepositoryConnector {
 
-  private static final Map<String, String> checksumAlgos;
-  
-  static {
-    LinkedHashMap<String, String> _checksumAlgos = new LinkedHashMap<>();
-    _checksumAlgos.put("SHA-1", ".sha1");
-    _checksumAlgos.put("MD5", ".md5");
-    checksumAlgos = Collections.unmodifiableMap(_checksumAlgos);
-  }
+	private static final Map<String, String> checksumAlgos;
+	private final int maxThreads;
+	private static final String CONFIG_PROP_THREADS = "aether.connector.basic.threads";
+
+	static {
+		LinkedHashMap<String, String> _checksumAlgos = new LinkedHashMap<>();
+		_checksumAlgos.put("SHA-1", ".sha1");
+		_checksumAlgos.put("MD5", ".md5");
+		checksumAlgos = Collections.unmodifiableMap(_checksumAlgos);
+	}
 
   private final Logger logger = LoggerFactory.getLogger(AetherRepositoryConnector.class);
   
@@ -108,7 +121,36 @@ class AetherRepositoryConnector implements RepositoryConnector {
   private final FileProcessor fileProcessor;
   private final RemoteRepository repository;
 
-  private final AetherClient aetherClient;
+	private final AetherClient aetherClient;
+	private Executor executor;
+
+	private Executor getExecutor(Collection<?> artifacts, Collection<?> metadatas) {
+		if (maxThreads <= 1) {
+			return DirectExecutor.INSTANCE;
+		}
+		
+		int tasks = safe(artifacts).size() + safe(metadatas).size();
+		if (tasks <= 1) {
+			return DirectExecutor.INSTANCE;
+		}
+
+		if (executor == null) {
+			executor = new ThreadPoolExecutor(maxThreads, maxThreads, 3L, TimeUnit.SECONDS,
+					new LinkedBlockingQueue<Runnable>(),
+					new WorkerThreadFactory(getClass().getSimpleName() + '-' + repository.getHost() + '-'));
+		}
+		return executor;
+	}
+
+	private static class DirectExecutor implements Executor {
+
+		static final Executor INSTANCE = new DirectExecutor();
+
+		public void execute(Runnable command) {
+			command.run();
+		}
+
+	}
 
   class FileSource implements RetryableSource {
 
@@ -188,6 +230,8 @@ class AetherRepositoryConnector implements RepositoryConnector {
     }
 
     this.aetherClient = newAetherClient(repository, session, sslSocketFactory);
+	maxThreads = ConfigUtils.getInteger( session, 5, CONFIG_PROP_THREADS, "maven.artifact.threads" );
+
   }
 
   private static OkHttpAetherClient newAetherClient(RemoteRepository repository, RepositorySystemSession session,
@@ -288,23 +332,27 @@ class AetherRepositoryConnector implements RepositoryConnector {
     CountDownLatch latch = new CountDownLatch(artifactDownloads.size() + metadataDownloads.size());
 
     Collection<GetTask<?>> tasks = new ArrayList<GetTask<?>>();
+    Executor executor = getExecutor( artifactDownloads, metadataDownloads );
+	RunnableErrorForwarder errorForwarder = new RunnableErrorForwarder();
+
 
     for (MetadataDownload download : metadataDownloads) {
       String resource = layout.getLocation(download.getMetadata(), false).getPath();
       GetTask<?> task = new GetTask<MetadataTransfer>(resource, download.getFile(), download.getChecksumPolicy(), latch, download, METADATA);
       tasks.add(task);
-      task.run();
+      executor.execute( errorForwarder.wrap( task ) );
     }
 
     for (ArtifactDownload download : artifactDownloads) {
       String resource = layout.getLocation(download.getArtifact(), false).getPath();
       GetTask<?> task = new GetTask<ArtifactTransfer>(resource, download.isExistenceCheck() ? null : download.getFile(), download.getChecksumPolicy(), latch, download, ARTIFACT);
       tasks.add(task);
-      task.run();
+      executor.execute( errorForwarder.wrap( task ) );
     }
 
     await(latch);
-
+    errorForwarder.await();
+	
     for (GetTask<?> task : tasks) {
       task.flush();
     }
